@@ -1,0 +1,287 @@
+<html><head>
+<meta http-equiv="content-type" content="text/html; charset=windows-1252"><script src="sss_files/browser.script.iife.js"></script>
+
+  <!-- Textbox -->
+<script src="sss_files/prompt.js"></script></head><body><textarea id="secretdata" name="secretdata" rows="20" cols="200">put your secret data here
+</textarea> 
+<br><br>
+<div>REQUIRED</div>
+<select id="required" name="required">
+    <option value="1" selected="selected">1</option>
+    <option value="2">2 </option>
+    <option value="3">3</option>
+    <option value="4">4 </option>
+    <option value="5">5</option>
+    <option value="6">6 </option>
+    <option value="7">7</option>
+    <option value="8">8 </option>
+    <option value="9">9</option>
+    <option value="10">10</option>
+</select> 
+
+<div>TOTAL</div>
+<select id="count" name="count">
+    <option value="1" selected="selected">1</option>
+    <option value="2">2 </option>
+    <option value="3">3</option>
+    <option value="4">4 </option>
+    <option value="5">5</option>
+    <option value="6">6 </option>
+    <option value="7">7</option>
+    <option value="8">8 </option>
+    <option value="9">9</option>
+    <option value="10">10</option>
+</select> <br><br>
+<div id="generated"></div>
+<br><br>
+<button id="generate">Generate Secret</button>
+<br><br>
+
+<textarea id="shards" name="shards" rows="20" cols="200">put the secrets here one per line
+</textarea>  <br><br>
+<button id="reassemble">Decode Secret</button>
+<div id="result"></div>
+<script type="text/ruby">
+require "js"
+require 'securerandom'
+require 'base64'
+
+module SSSA
+    class Utils
+        attr_accessor :prime
+
+        def initialize(prime=115792089237316195423570985008687907853269984665640564039457584007913129639747)
+            @prime = prime
+        end
+
+        # Returns a random number on 0 to @prime-1, inclusive.
+        def random()
+            SecureRandom.random_number(@prime)
+        end
+
+        # split_ints and merge_ints converts between string and integer array,
+        # where the integer is right-padded until it fits a 256 bit integer.
+        def split_ints(secret)
+            result = []
+
+            secret.split('').map { |x|
+                data = x.unpack("H*")[0]
+                "0"*(data.size % 2) + data
+            }.join("").scan(/.{1,64}/) { |segment|
+                result.push (segment+"0"*(64-segment.size)).hex
+            }
+
+            return result
+        end
+
+        def merge_ints(secrets)
+            result = []
+
+            secrets.each { |int|
+                data = int.to_s(16)
+                ("0"*(64-data.size) + data).scan(/../) { |segment|
+                    result.push segment.hex
+                }
+            }
+
+            return result.pack('C*').force_encoding('UTF-8').encode('UTF-8', 'UTF-8', undef: :replace, invalid: :replace,  replace: '').gsub(/\u0000*$/, '')
+        end
+
+        # This evaluates a polynomial with reversed coefficients at a given
+        # value. Namely, given the array [a, b, c, d], and x=value, the equation
+        # is:
+        # a + bx + cx^2 + dx^3
+        def evaluate_polynomial(coefficients, value)
+            result = 0
+            coefficients.reverse_each do |coefficient|
+                result = result*value + coefficient
+                result = result % @prime
+            end
+
+            return result
+        end
+
+        # The to_base64 and from_base64 converts between base 10 and base 64
+        # integers, with a left-zero-padded, fixed-size hex representation.
+        # This is cross-compatible with the go implementation, and by changing
+        # base versus encoding as a string, it reduces the size of the
+        # representation. Note: the output is always 44 characters.
+        def to_base64(number)
+            return Base64.urlsafe_encode64(("0"*(64-number.to_s(16).size) + number.to_s(16)).scan(/../).map{|x| x.hex.chr}.join)
+        end
+
+        def from_base64(number)
+            segment = Base64.urlsafe_decode64(number).split('').map do |x|
+                if x.ord > 15
+                    x.ord.to_s(16)
+                else
+                    "0" + x.ord.to_s(16)
+                end
+            end
+            return (segment+["00"]*(32-segment.size)).join.hex
+        end
+
+        # Uses extended Euclidian algorithm to compute the GCD of a pair of
+        # numbers, and returns [gcd, x, y], such that gcd = ax+ by.
+        #
+        # Note: computing the GCD over a finite field with a = @prime means that
+        # GCD will always return 1.
+        def gcd(a, b)
+            if b == 0
+                return [a, 1, 0]
+            else
+                n = (a*1.0/b).floor
+                c = a % b
+                r = gcd(b, c)
+                return [r[0], r[2], r[1]-r[2]*n]
+            end
+        end
+
+        # Computes the multiplicative inverse of the given number on the finite
+        # field. Note: number should never be less than zero; however, if it is,
+        # the inverse is inverted
+        def mod_inverse(number)
+            remainder = gcd(@prime, number % @prime)[2]
+            if (number < 0)
+                remainder *= -1
+            end
+            return (@prime + remainder) % @prime
+        end
+        end
+end
+
+    module SSSA
+        @prime = 115792089237316195423570985008687907853269984665640564039457584007913129639747
+        @util = SSSA::Utils.new(@prime)
+
+        # Create a new array of Shamir's Shares with a minimum, total, and secret
+        # Note: output is an array of base64 strings, of length a multiple of 88,
+        # as each x, y point is a 256 bit (i.e., 44 base64 character) integer and
+        # each share is one pair, per number of integers secret must be split into
+        def self.create(minimum, shares, raw)
+            secret = @util.split_ints(raw)
+            numbers = [0]
+            polynomial = []
+            (0...secret.size).each do |i|
+                polynomial.push [secret[i]]
+                (1...minimum).each do |j|
+                    value = @util.random()
+                    while numbers.include? value
+                        value = @util.random()
+                    end
+                    numbers.push value
+                    polynomial[i].push value
+                end
+            end
+
+            result = [""]*shares
+
+            (0...shares).each do |i|
+                (0...secret.size).each do |j|
+                    value = @util.random()
+                    while numbers.include? value
+                        value = @util.random()
+                    end
+
+                    y = @util.evaluate_polynomial(polynomial[j], value)
+
+                    result[i] += @util.to_base64(value)
+                    result[i] += @util.to_base64(y)
+                end
+            end
+
+            return result
+        end
+
+        # Takes a set of shares and combines them to a secret value using Shamir's
+        # Secret Sharing Algorithm. Each share must be a string of base-64 encoded
+        # shares of length modulo 88 base64 characters (512 bits in binary)
+        def self.combine(shares)
+            secrets = []
+
+            shares.each_with_index do |share, index|
+                if share.size % 88 != 0
+                    return
+                end
+
+                count = share.size / 88
+                secrets.push []
+
+                (0...count).each do |i|
+                cshare = share[i*88, (i+1)*88]
+                secrets[index][i] = [@util.from_base64(cshare[0...44]), @util.from_base64(cshare[44...88])]
+             end
+         end
+
+        secret = [0] * secrets[0].size
+        secret.each_with_index do |part, part_index|
+            secrets.each_with_index do |share, share_index|
+                origin = share[part_index][0]
+                originy = share[part_index][1]
+                numerator = 1
+                denominator = 1
+                secrets.each_with_index do |product, product_index|
+                    if product_index != share_index
+                        current = product[part_index][0]
+                        numerator = (numerator * (-1*current)) % @prime
+                        denominator = (denominator * (origin - current)) % @prime
+                    end
+                end
+                working = ((originy * numerator * @util.mod_inverse(denominator)) + @prime)
+                secret[part_index] = (secret[part_index] + working) % @prime
+            end
+        end
+        return @util.merge_ints(secret)
+    end
+    # Takes in a given candidate to check if it is a valid secret
+    #
+    # Requirements:
+    #    Length multiple of 88
+    #    Can decode each 44 character block as base64
+    #
+    # Returns only true/false
+    def self.isValidShare?(candidate)
+        if candidate.size % 88 != 0
+           return false
+        end
+        count = candidate.size / 44
+        for j in 0..count
+            part = candidate[j*44, (j+1)*44]
+            decode = @util.from_base64(part)
+            if decode < 0 || decode > @prime
+                return false
+            end
+        end
+        return true
+    end
+end
+
+puts "ready to roll"
+document = JS.global[:document]
+button = document.getElementById "reassemble"
+result = document.getElementById "result"
+shards = document.getElementById "shards"
+
+button.addEventListener "click" do |e|
+    txt = shards[:value].to_s
+    s = txt.split("\n")
+    decoded = SSSA::combine(s)
+    result[:innerText] = decoded
+end
+
+generate = document.getElementById "generate"
+generated = document.getElementById "generated"
+required = document.getElementById "required"
+count = document.getElementById "count"
+secdata = document.getElementById "secretdata"
+
+generate.addEventListener "click" do |e|
+    cnt = count[:value].to_s.to_i
+    req = required[:value].to_s.to_i
+    txt = secdata[:value].to_s
+    puts "generating #{req}/#{cnt} shards"
+    secretz = SSSA::create(req, cnt, txt)
+    generated[:innerText] = secretz.join("\n")
+end
+  </script>
+</body></html>
